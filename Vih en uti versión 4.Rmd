@@ -1,0 +1,1266 @@
+---
+title: "Survival of HIV patients admitted to the intensive care unit"
+author: "Isaac"
+date: today()
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+```{r Loading packages and Excel spreadsheets, include = F, warnings = F}
+library(tidyverse)
+library(readxl)
+library(haven)
+library(icd)
+library(lubridate)
+library(pastecs)
+library(stargazer)
+library(tinytex)
+library(knitr)
+library(tufte)
+library(bookdown)
+library(survival)
+library(devtools)
+library(broom)
+library(arsenal)
+library(survminer)
+library(ggsci)
+library(forestplot)
+library(meta)
+library(forestmodel)
+
+minusculas <- function(x){
+  colnames(x) <- tolower(colnames(x))
+   x <- x %>%
+  rename(registro = numreg)
+}
+
+rna <- read_excel("tblRNA.xlsx") %>% 
+  minusculas()
+
+follow <- read_excel("tblFOLLOW.xlsx") %>% 
+  minusculas()
+
+art <- read_csv("tblART.csv") %>% 
+  minusculas()
+
+cd4 <- read_csv("tblLAB_CD4.csv") %>% 
+  minusculas()
+
+basic <- read_excel("tblbasic_130319.xlsx") %>% 
+  minusculas()
+
+visit <- read_excel("tblVISIT.xlsx") %>% 
+  minusculas() %>% 
+  mutate(visit_d = ymd(visit_d)) %>%
+  select(registro, visit_d)
+
+uti_in <- read_dta("uti_paco2.dta")
+
+micro <- read_excel("PRUEBAS MICROBIOLÓGICAS VIH EN UTI.xlsx") %>% 
+  select(-...7) 
+
+hospitalizacion <- read_dta("braulio_final7.dta") %>% 
+  filter(registro %in% uti_in$registro) %>% 
+  rename(fecha_ing_hosp = fech_ing,
+         fecha_egr_hosp = fech_egr) %>% 
+  mutate(registro = as.numeric(registro))
+
+muertes_bibi <- read_excel("muertes_bibi.xlsx") %>% 
+  minusculas()  %>% 
+  select(registro, evento, fecha_evento) %>% 
+  filter(evento == "DEFUNCION") %>% 
+  mutate(registro = as.double(registro))
+
+data_uci <- read_excel("Recoleccion de datos vih uci.xlsx")
+
+load("~/Protocolos SS/VIH en la UCI (supervivencia)/vih_isaac.rda")
+
+vih_isaac <- reporte %>% 
+  filter(!is.na(muerte)) %>% 
+  rename(fecha_evento = fec_egr) %>% 
+  select(registro, fecha_evento)
+
+muertes_faltantes <- muertes_bibi %>% 
+  full_join(vih_isaac, by = "registro") %>% 
+  mutate(death = if_else(is.na(fecha_evento.y), ymd(fecha_evento.x), ymd(fecha_evento.y))) %>% 
+  select(registro, death)
+```
+
+```{r Unión de info recabada de los expedientes, muertes faltantes proporcionadas por bibi, y base de hospitalización, include = F}
+#Base de datos con la información que recabé de expedientes
+data_uci_mod <- data_uci %>% 
+  ungroup() %>% 
+  mutate(falla_resp_ing_hosp = as.logical(falla_resp_ing_hosp),
+         falla_resp_ing_uti = as.logical(falla_resp_ing_uti),
+         profilaxis = as.logical(profilaxis),
+         naive= as.logical(naive), 
+         art = as.logical(falla_resp_ing_hosp), 
+         sepsis_h = as.logical(sepsis_h), 
+         sepsis = as.logical(sepsis), 
+         art_ing_uti = as.logical(art_ing_uti),
+         art_hosp = as.logical(art_hosp),
+         trr = if_else(is.na(trr) | trr == "F", F, T),
+         org_fail_hist = as.logical(org_fail_hist),
+         lra = as.logical(lra),
+         vasopresor = as.logical(vasopres),
+         quimio = as.logical(quimio),
+         esteroide = as.logical(esteroide),
+         antimicrobianos = as.logical(antimicrobianos), 
+         registro = as.double(registro)) %>% 
+  group_by(registro) %>% 
+  mutate(dx_vih = if_else(!is.na(dx_hosp...107) & dx_hosp...107 == "vih", T, F)) %>% 
+  filter(motivo_ing != "NO_VIH" | is.na(motivo_ing))
+
+#Unión de base de datos que recabé de los expedientes con muertes faltantes proporcionadas por bibi
+data_uci_bibi <- data_uci_mod %>% 
+  left_join(muertes_faltantes, "registro") %>% 
+  mutate(defuncion = if_else(is.na(defuncion) & !is.na(death), ymd(death), ymd(defuncion)))
+
+#Aquí estoy uniendo la base de hospitalizaciónes con lo que recabé de los expedientes
+data_uci_belaunz <- data_uci_bibi %>% 
+  left_join(select(hospitalizacion, registro, fech_ing, fech_egr, si_urg, tot_veces_urg, num_estancia, 
+                   entrada, tipo_ingreso, paciente_qx), 
+            by = "registro") %>% 
+  mutate(fecha_egr_hosp = ymd(fech_egr),
+         fecha_ing_hosp = ymd(fech_ing),
+         fecha_ing_uti = ymd(fecha_ing_uti),
+         fecha_egr_uti = ymd(fecha_egr_uti),
+         defuncion = ymd(defuncion)) %>% 
+  filter(fech_ing-1 <= fecha_ing_uti & fech_egr+5 >= fecha_egr_uti) %>% 
+  mutate(pam = ((2*diast)+sist)/3,
+         hto = hb * 3,
+         pafi = round(po2/(fio2/100),1),
+         paco2 = if_else(between(ph, 7.36, 7.44), 32,
+                         if_else(ph < 7.36, 22, 42)),
+         grad_aa = round((fio2/100)*(587-47) - (paco2/.83), 1))#Aquí calculo pam, hto, pafi, paco2 y grad_aa porque se necesitarán para el apache y el sofa 
+```
+
+```{r Unión de información de la uti proporcionada por dr Belaunz con basic, include = F}
+#uti_in es la base que me pasó el Dr Belaunzarán, notese que solo contiene información de la UTI (el resto de hospitalizaciones no están)
+uti_bas <- basic %>%
+  inner_join(uti_in, by = "registro") %>% 
+  filter()  #Unión de basic con la base de UTI
+
+uti_basic <- uti_bas %>% #Pulimos ciertas variables de la base basic + UTI, no se hizo en el paso previo por probable glitch (creo que no lo corría bien)
+  mutate(enrol_d = ymd(enrol_d), 
+         birth_d = ymd(birth_d),
+         firstvis_d = ymd(firstvis_d),
+         hivdiagnosis_d = ymd(hivdiagnosis_d),
+         aids_d = ymd(aids_d),
+         edad_al_ingreso = round(as.integer(fech_ing - birth_d)/365),
+         duracion_estancia = fech_egr-fech_ing,
+         muerte = if_else(muerte_sino == 1, "No", "Si")) %>%
+  filter(fech_ing >= "2003-01-01") %>%
+  rename(fecha_ing = fech_ing, fecha_egr = fech_egr) %>%
+  select(registro, fecha_ing, fecha_egr, birth_d, edad_al_ingreso, everything()) %>%
+  group_by(fecha_ing) %>%
+  slice(1) 
+
+uti_periodo <- uti_in %>% #Aquí filtramos la info de la base que me pasó Belaunzarán, según la fecha. CREO QUE ESTO NO ES NECESARIO, FIJARSE SI LA USO DESPUÉS 
+  filter(fech_ing >= "2003-01-01")
+
+uti_basic_prev <- uti_basic %>% #Aquí sacamos a los pacientes que hayan tenido una fecha de ingreso a la terapia previa a la fecha de enrolamiento
+  filter(enrol_d < fecha_ing) #CREO QUE ESTO NO ES NECESARIO, FIJARSE SI LO UTILIZO DESPUÉS
+
+uti_unique_patient <- uti_basic %>% #Aquí estoy filtrando según el registro, sólo para obtener variables sociodemográficas
+  group_by(registro) %>%
+  slice(1) #CREO QUE ESTO NO ES NECESARIO, FIJARSE SI LO UTILIZO DESPUÉS
+```
+
+```{r Depuración de información sobre carga viral y CD4, include = F}
+#Aquí estoy incluyendo información sobre carga viral que hayan tenido en el rango de 90 días previos al ingreso a la uti y 30 días posteriores al ingreso
+#Cuando complete la base de microbiología, probablemente incluya solo las cargas que hayan tenido durante su hospitalización o las previas a ella en caso de no tener carga viral en la hospitalización (lo cual podría suceder en caso de que la previa sea muy reciente)
+#Esto mismo haré con la cuenta de CD4, siempre que se hace carga viral se tiene conteo de CD4, entonces no debería representar ningún problema
+
+
+#Aquí simplifico la info de la base de cargas virales, filtrando según fecha de hospitalización
+rna_mod <- rna %>% 
+  mutate(rna_d = ymd(rna_d),
+         fecreg = ymd(fecreg),
+         registro = as.numeric(registro)) %>%
+  filter(registro %in% uti_basic$registro) %>% 
+  left_join(select(hospitalizacion, registro, fecha_ing_hosp, fecha_egr_hosp), by = "registro")%>% 
+  mutate(rna_d_hosp = if_else(rna_d >= fecha_ing_hosp & rna_d <= fecha_egr_hosp, rna_d,
+                                   if_else(fecha_ing_hosp - rna_d <= 365 , rna_d, ymd("1900-09-09"))),
+         rna_v_hosp = if_else(rna_d >= fecha_ing_hosp & rna_d <= fecha_egr_hosp, rna_v,
+                                   if_else(fecha_ing_hosp -rna_d <=365, rna_v, -123456))) %>% 
+  group_by(registro) 
+
+rna_mod$rna_d_hosp[rna_mod$rna_d_hosp == "1900-09-09"] <- NA
+rna_mod$rna_v_hosp[rna_mod$rna_v_hosp == -123456] <- NA
+
+rna_mod <- rna_mod %>% 
+  arrange(desc(rna_d_hosp)) %>% 
+  slice(1)
+
+sum(is.na(rna_mod$rna_v_hosp))
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uti_basic_rna <- uti_basic %>% 
+  left_join(rna_mod, by = "registro")
+
+rna_lvl_neardate <- uti_basic_rna %>% #Aquí especifico que tome las cargas virales sólo durante la hospitalización (y en ausencia de, entonces previos a ella)
+  mutate(diff_rna = fecha_ing-rna_d) %>%
+  filter(diff_rna < 90 & diff_rna >-30)
+
+
+%>%
+  group_by(fecha_ing)%>%
+  summarise(detectable = if_else(all(rna_v < 200), "indetectable", "detectable"))
+
+uti_basic_2 <- uti_basic %>%
+  left_join(rna_lvl_neardate, by = "fecha_ing") 
+
+#Aquí analizamos los CD4 POR FECHA, es decir, por ingreso
+#Entran aquellas que se hayan tomado en los 90 días previos o en el mes posterior a al ingreso
+#Probablemente cuando termine la base de microbiología incluya primordialmente los conteos tomados durante la hospitalización
+
+cd4_1 <- cd4 %>%
+  mutate(cd4_d = dmy(cd4_d)) %>%
+  filter(registro %in% uti_basic$registro)
+cd4_1
+y1 <- uti_basic %>%
+  left_join(cd4_1, by = "registro")
+
+cd4_count_neardate <- y1 %>%
+  mutate(diff_cd4 = fecha_ing-cd4_d) %>%
+  filter(diff_cd4 < 90 | diff_cd4 >-30) %>%
+  summarise(cuenta_cd4 = if_else(any(cd4_v < 200), "below 200", "above 200"))
+
+uti_basic_3 <- uti_basic %>%
+  left_join(cd4_count_neardate, by = "fecha_ing")
+```
+
+```{r Depurando la información sobre tratamiento antirretroviral, include = F}
+art_1 <- art %>%
+  filter(registro %in% uti_basic$registro) %>%
+  group_by(registro, inicioesquema, finalesquema) %>%
+  count(cveantirretroviral) %>%
+  mutate(esquema = if_else(is.na(cveantirretroviral), "No treatment reg",
+                           paste(cveantirretroviral, collapse = ",")),
+         es_haart = if_else(str_count(esquema, ",") > 1 | esquema == "Atripla", 
+                            "haart", "no haart")) %>%
+  select(registro, inicioesquema, finalesquema, esquema, es_haart) %>%
+  distinct()
+
+#Aquí estoy definiendo tx_prev_ing como que haya iniciado el esquema al menos 3 meses previo a su ingreso a la UTI y que no haya finalizado su esquema previo al ingreso
+#OJO con esta variable, probablemente haya que redefinirla simplemente como cualquier tratamiento previo al ingreso HOSPITALARIO (no solo a UTI)
+z <- uti_basic %>%
+  right_join(art_1, by = "registro") %>%
+  mutate(tx_prev_ing = if_else(!is.na(neardate(registro, registro, 
+                                        fecha_ing, inicioesquema, "prior")) &
+                                 (finalesquema > fecha_ing | is.na(finalesquema) &
+                                    (fecha_ing - inicioesquema) >=90), T,
+                                F)) %>%
+  select(registro, fecha_ing, fecha_egr, inicioesquema, finalesquema, 
+         esquema, es_haart, tx_prev_ing, everything()) 
+
+z1 <- z %>%
+  filter(tx_prev_ing == T) %>% 
+  group_by(fecha_ing) %>%
+  slice(1)#Solo pacientes cuyo tx inició previo al ingreso a UTI
+```
+
+```{r Uniendo la información generada en chunks previos en un solo dataframe, include = F}
+#Construyendo tabla de variables demográficas
+uti_basic_22 <- uti_basic_2 %>%
+  select(registro, fecha_ing, detectable)
+
+uti_basic_33 <- uti_basic_3 %>%
+  select(registro, fecha_ing, cuenta_cd4)
+
+uti_z1 <- z1 %>%
+  select(registro, fecha_ing, inicioesquema, finalesquema, esquema, es_haart, tx_prev_ing)
+
+#Uniendo los dataframes
+uti_basico <- uti_basic %>%
+  left_join(uti_basic_22, by = "fecha_ing") %>%
+  left_join(uti_basic_33, by = "fecha_ing") %>%
+  left_join(uti_z1, by = "fecha_ing") %>%
+  rename(registro_ = registro.x) %>%
+  select(registro_:enrol_d, gender, duracion_estancia, detectable, cuenta_cd4, 
+         inicioesquema, finalesquema, esquema, es_haart, tx_prev_ing, ing_cie10_dx,ing_dx_prin, egre_cie10_dx, egr_dx) %>%
+  mutate(tx_prev_ing = if_else(is.na(tx_prev_ing),F, T),
+         ing_dx = tolower(ing_dx_prin) , 
+         egr_dx = tolower(ing_dx_prin)) %>%
+  rename(registro = registro_)
+
+uti_basico_1 <- uti_basico %>%
+  mutate(motivo_ingreso = 
+           if_else(str_detect(ing_dx,"acidosis") | str_detect(ing_dx,"choque septico")|
+                     str_detect(ing_dx,"colangitis")|str_detect(ing_dx,"diarrea") |
+                      str_detect(ing_dx,"infecciones multiples") | 
+                     str_detect(ing_dx, "fascitis") |str_detect(ing_dx, "perforacion")|
+                     str_detect(ing_dx,"septicemia")|str_detect(ing_dx, "peritonitis")|
+                     str_detect(ing_dx,"endocarditis")|str_detect(ing_dx,"absceso")|
+                     str_detect(ing_dx,"infecciones multiples")|
+                     str_detect(ing_dx,"infecciones bacteria")|
+                     str_detect(ing_dx, "enfermedades infecci")|
+                     str_detect(ing_dx,"tuberculosis")|
+                    str_detect(ing_dx,"micobacteria"),
+                   "Sepsis", 
+                   if_else(str_detect(ing_dx, "bronco")|str_detect(ing_dx, "pulmonar")|
+                             str_detect(ing_dx,"neumonia")|
+                             str_detect(ing_dx, "hemotorax") | 
+                             str_detect(ing_dx, "dificultad respiratoria") |
+                             str_detect(ing_dx, "neumonitis")|
+                             str_detect(ing_dx,"insuficiencia respiratoria"),"Falla respiratoria",
+                                   if_else(str_detect(ing_dx, "tumor")|
+                                             str_detect(ing_dx,"sarcoma")|
+                                             str_detect(ing_dx,"linfoma"), 
+                                           "Tumoracion/CA miscelaneo", 
+                                  if_else(str_detect(ing_dx, "cerebral")|
+                                              str_detect(ing_dx, "encefalitis")|
+                                              str_detect(ing_dx, "epilepsia") |
+                                              str_detect(ing_dx, "hemorragia")|
+                                            str_detect(ing_dx,"sistema nervioso")|
+                                            str_detect(ing_dx,"convulsiones"),
+                                                   "Causas neurologicas",
+                                  if_else(str_detect(ing_dx, "cirugia")|
+                                            str_detect(ing_dx,"hernia"),
+                                      "Cuidados post-quirurgicos", "Otros")))))) %>%
+  mutate(fecha_ing_ = fecha_ing) %>%
+  separate(fecha_ing_, 4, into = c("year_ing", "mes_d_ing")) %>%
+  mutate(year_ing = as.integer(year_ing),
+         art_prev = ifelse(tx_prev_ing == T, "ART previo al ingreso",
+                            "Sin ART previo al ingreso"))
+```
+
+```{r Generando el tiempo de supervivencia, include = F}
+#Ojo, aquí no estoy censurando a un año, solo estoy calculando el tiempo de supervivencia en base a si tiene fecha de muerte o pérdida de seguimiento descrita por la base (la última visita es el referente para el tiempo de supervivencia en quienes no hayan tenifdo algún evento)
+uti_basico_2 <- uti_basico_1 %>%
+  left_join(follow, by = "registro") %>%
+  left_join(visit, by = "registro") %>%
+  group_by(registro) %>%
+  arrange(desc(visit_d), .by_group = T) %>%
+  mutate(last_visit = first(visit_d)) %>%
+  select(everything(), -visit_d) %>%
+  distinct() %>%
+  mutate(muerte = if_else(!is.na(death_y), "Si", "No"),
+         death_d = ymd(death_d),
+         drop_d = ymd(drop_d),
+         surv_time = if_else(!is.na(death_d),death_d-fecha_ing,
+                             if_else(!is.na(drop_d) & drop_d > fecha_egr, drop_d-fecha_ing, 
+                                     if_else(!is.na(last_visit) & last_visit > fecha_egr, 
+                                             last_visit-fecha_ing, fecha_egr-fecha_ing))),
+         surv_time = if_else(surv_time == 0, surv_time + 1, surv_time),
+        evento = if_else(muerte == "Si", 1, 0),
+        asoc_vih = ifelse(any(str_detect(ing_dx, "vih")|
+                             str_detect(ing_dx, "tuberculosis")|
+                           str_detect(ing_dx, "cripto")|
+                              str_detect(ing_dx, "citom")|
+                             str_detect(ing_dx, "mico")|
+                              str_detect(ing_dx, "cocci")), "si", "no")) %>%
+  distinct()
+```
+
+```{r Agregando cargas y cd4 cuantitativas más cercanas al internamiento, include = F}
+#Base con la carga del primer internamiento
+carga_rna <- uti_basico_2 %>%
+  right_join(rna, by = "registro") %>%
+  filter(!is.na(detectable))%>%
+  group_by (registro) %>%
+  mutate(rna_d = ymd(rna_d),
+         diff_rna = ifelse(fecha_ing-rna_d<0, 
+                          -(fecha_ing-rna_d), fecha_ing-rna_d )) %>%
+  filter(diff_rna == min(diff_rna)) %>%
+  select(registro, fecha_ing, rna_d, diff_rna, rna_v)
+  
+#Base con el conteo del primer internamiento
+conteo_cd4 <- uti_basico_2 %>%
+  right_join(cd4, by = "registro") %>%
+  filter(!is.na(cuenta_cd4))%>%
+  group_by (registro) %>%
+  mutate(cd4_d = dmy(cd4_d),
+         diff_cd4 = ifelse(fecha_ing-cd4_d<0, 
+                          -(fecha_ing-cd4_d), fecha_ing-cd4_d ))%>%
+  filter(diff_cd4 == min(diff_cd4)) %>%
+  select(registro, fecha_ing, cd4_d, diff_cd4, cd4_v)
+
+uti_basico_4.5 <- uti_basico_2 %>%
+  left_join(carga_rna, by = "registro") %>%
+  left_join(conteo_cd4, by = "registro") 
+```
+
+```{r Censurando los tiempos de supervivencia según el tiempo de interés y los eventos, include = F}
+#Base con solo el primer internamiento a modo de supervivencia
+uti_basico_5 <- uti_basico_4.5 %>%
+  group_by(registro) %>%
+  slice(1) %>%
+  mutate(surv_time_m = if_else(surv_time == 0, surv_time+1, surv_time),
+         muerte_uti = if_else(!is.na(death_d) & death_d <= fecha_egr, 1, 0),
+         muerte_28 = if_else(evento == 1 & surv_time_m <= 28, 1, 0),
+         muerte_60 = if_else(evento == 1 & surv_time_m <= 60, 1, 0),
+         muerte_1a = if_else(evento == 1 & surv_time_m <= 365, 1, 0),
+         surv_time_cens1a = ifelse(surv_time_m > 365, 365, surv_time_m),
+         surv_time_cens28 = ifelse(surv_time_m > 28, 28, surv_time_m),
+         surv_time_cens60 = ifelse(surv_time_m > 60, 60, surv_time_m),
+         perdido_seg = if_else(evento == 0 & surv_time < 180, T, F),
+         fecha_ing = fecha_ing.x) %>% 
+  filter(registro != 259105 &
+           registro != 219863)#Estos pacientes adquirieron vih posterior al ingreso o no tienen VIH
+
+uti_km <- uti_basico_5
+
+mediana <- uti_km %>%
+  filter(tx_prev_ing == T) %>%
+  group_by(registro) %>%
+  summarise(seguimiento = fecha_ing-inicioesquema) %>%
+  arrange(seguimiento)
+```
+
+```{r Modelos de Cox (probablemente sean inútiles por los que hice después, confirmar si puedo borrarlos), include = F}
+cox_diferentes <- function(x){
+  summary(coxph(Surv(x, evento) ~ gender + edad_al_ingreso + detectable + cuenta_cd4 + tx_prev_ing +
+                   motivo_ingreso, data =  uti_basico_5))
+}
+
+res.cox <- coxph(Surv(surv_time_m, evento) ~ gender + edad_al_ingreso + detectable + cuenta_cd4 + art_prev +
+                   motivo_ingreso, data =  uti_basico_5)
+
+```
+
+```{r Unión de base final con micro, include = F}
+#"Naive a tratamiento?"
+basic_naive <- basic %>%
+  select(registro, naive_y)
+
+uti_km <- uti_km %>%
+  left_join(basic_naive, by = "registro")
+
+art_fil <- art %>%
+  filter(registro %in% uti_km$registro[uti_km$tx_prev_ing == F]) %>%
+  select(registro, inicioesquema)
+
+uti_km_nofinal <- uti_km %>%
+  left_join(art_fil, by = "registro") %>%
+  rename(inicioesquema = inicioesquema.y) %>%
+  filter(!is.na(inicioesquema)) %>%
+  mutate(date_dif = fecha_ing.x-inicioesquema) %>%
+  filter(date_dif > 0)
+
+uti_km <- uti_km %>%
+  mutate(naive_al_ing = if_else(tx_prev_ing == T, "No", 
+                         if_else(registro %in% uti_km_nofinal$registro, "No",
+                                 if_else(!is.na(naive_y) & naive_y == "Sí", "Si", "Desc"))), 
+         naive_logical =ifelse(naive_al_ing == "No", F, 
+                               ifelse(naive_al_ing == "Si", T, NA)))
+
+cual_mo <- function(x){
+  if_else((!is.na(micro$microorg) & micro$microorg == x) | 
+          (!is.na(micro$microorg_2) & micro$microorg_2 == x) | 
+          (!is.na(micro$microorg_3) & micro$microorg_3  == x) | 
+          (!is.na(micro$microorg_3) & micro$microorg_4  == x), T, F) 
+}
+
+hongos <- c("a_fumigatus", "a_niger", "c_albicans", "h_capsulatum", "candida_sp", "c_glabrata", "c_immitis", "c_neo", "rhodotorula")
+
+micro_2 <- micro %>% 
+  mutate(positivo = as.logical(pos_neg),
+         has_tb = if_else((dirigida == "tb" & tipo_prueba != "ppd" & positivo == T)|
+                            cual_mo("tb")==T, T,F),
+         has_micobacteria = if_else(has_tb == T |
+                                      cual_mo("m_bovis") == T |
+                                      cual_mo("mac") == T, T, F),
+         has_jirovecii = if_else(((dirigida == "jirovecii" | dirigida == "grocott")& positivo == T) |
+                                   cual_mo("jirovecii") == T, T, F),
+         has_hongo = ifelse(has_jirovecii == T |
+                              cual_mo("a_fumigatus")|
+                              cual_mo("a_niger")|
+                              cual_mo("c_albicans")|
+                              cual_mo("h_capsulatum")|
+                              cual_mo("candida_sp")|
+                              cual_mo("c_glabrata")|
+                              cual_mo("c_immitis")|
+                              cual_mo("c_neo")|
+                              cual_mo("rhodotorula")|#Resumir este código con un map o  un apply
+                              cual_mo("c_tropicalis")|
+                              (dirigida == "cryptococo" &positivo == T), T, F),
+         has_bgn = if_else(cual_mo("e_coli")|
+                             cual_mo("p_aerugi")|
+                             cual_mo("ce_cloacae")|
+                             cual_mo("k_pneumo")|
+                             cual_mo("salmonella_d")|
+                             cual_mo("salmonella_a")|
+                             cual_mo("c_freundii")|
+                             cual_mo("a_bauma")|
+                             cual_mo("a_baumanii")|
+                             cual_mo("a_calcoaceticus")|
+                             cual_mo("k_oxytoca")|
+                             cual_mo("s_maltoph")|
+                             cual_mo("s_malto")|
+                             cual_mo("k_oxytoca")|
+                             cual_mo("p_putida"), T, F))
+
+micro_3 <- micro_2 %>% 
+  group_by(registro) %>% 
+  mutate(has_tuberculosis = if_else(any(has_tb == T), T,F),
+         has_pneumocystis = if_else(any(has_jirovecii ==T), T, F),
+         has_fungi = ifelse(any(has_hongo == T), T, F),
+         has_gramneg = ifelse(any(has_bgn == T), T, F),
+         carga_intra_hosp = ifelse(any(tipo_prueba == "carga_vih"), as.double(microorg[tipo_prueba == "carga_vih"]), -12345),
+         cd4_intra_hosp = ifelse(any(tipo_prueba == "cd4"), as.double(microorg[tipo_prueba == "cd4"]), -123)) %>% #Completar las cargas y los CD4 intrahospitalarios
+  ungroup() %>% 
+  filter(tipo_prueba != "carga_vih" & tipo_prueba != "cd4") %>% 
+  group_by(registro) %>% 
+  slice(1)
+
+#Colocando NAs que no pudieron modificarse con dplyr
+micro_3$has_tuberculosis[is.na(micro_3$has_tuberculosis)] <- F
+micro_3$has_fungi[is.na(micro_3$has_fungi)] <- F
+micro_3$has_pneumocystis[is.na(micro_3$has_pneumocystis)] <- F
+micro_3$carga_intra_hosp[micro_3$carga_intra_hosp == -12345] <- NA
+micro_3$cd4_intra_hosp[micro_3$cd4_intra_hosp == -123] <- NA
+
+uti_prefinal <- uti_km %>% 
+  left_join(select(micro_3, registro, has_tuberculosis:has_gramneg, carga_intra_hosp, cd4_intra_hosp), by = "registro")
+```
+
+```{r Cálculo y adición de APACHE a la base final, include = F}
+#Unión de las bases prefinal y data_uci_belaunz
+uti_final <- uti_prefinal %>% 
+  right_join(data_uci_belaunz, by = "registro")
+
+#Función de APACHE II 
+apache <- function(temp, pam, fc, fr, fio2, ph, sodio, potasio, crea, hto, leucos, glasgow, edad, 
+                   enf_prev, grad_aa, po2) {
+  sum(
+    temperatura = if_else(temp > 40.9, 4, if_else(
+      between(temp,39, 40.9), 3,
+      if_else(between(temp, 38.5, 38.9), 1,
+              if_else(between(temp, 36, 38.4), 0,
+                      if_else(between(temp, 34, 35.9), 1,
+                              if_else(between(temp, 32, 33.9), 2,
+                                      if_else(between(temp, 30, 31.9), 3, 4))))))),
+    
+   pa_media =  if_else(pam > 159, 4,
+            if_else(between(pam, 130, 159), 3,
+                    if_else(between(pam, 110, 129),2,
+                            if_else(between(pam, 70, 109), 0,
+                                    if_else(between(pam, 50,
+                                                    69),2,4))))),
+    
+    
+   frec_c = if_else(fc > 179, 4,
+            if_else(between(fc, 140, 179), 3,
+                   if_else(between(fc, 110,129), 2,
+                           if_else(between(fc, 70, 109), 0,
+                                   if_else(between(fc, 55, 69),2,
+                                           if_else(between(fc, 40, 54),3,4)))))),
+    
+    frec_r = if_else(fr > 49, 4,
+            if_else(between(fr, 35,49), 3,
+                    if_else(between(fr, 25, 34), 1,
+                            if_else(between(fr, 12,24), 0,
+                                    if_else(between(fr, 10,11), 1,
+                                            if_else(between(fr, 6,9),2,4)))))),
+    
+   fo2 =  if_else(fio2 >= 50,
+            if_else(grad_aa > 499, 4,
+                    if_else(between(grad_aa, 350, 499),3,
+                            if_else(between(grad_aa, 200, 349), 2, 0))),
+            if_else(po2 > 70, 0, if_else(
+              between(po2,61,70), 1,
+              if_else(between(po2,56,70),3,4)))),
+    
+   ph_art =  if_else(ph > 7.9, 4,
+            if_else(between(ph, 7.6, 7.69), 3, 
+                    if_else(between(ph, 7.5,7.59), 1,
+                            if_else(between(ph,7.33,7.49),0,
+                                    if_else(between(ph, 7.25,7.32),2,
+                                            if_else(between(ph, 7.15, 7.24), 3, 4)))))),
+    
+   na =  if_else(sodio > 179, 4,
+            if_else(between(sodio, 160, 179), 3, 
+                    if_else(between(sodio, 155, 159), 2,
+                            if_else(between(sodio, 150, 154),1,
+                                    if_else(between(sodio, 130, 149),0,
+                                            if_else(between(sodio, 120, 129),2,
+                                                    if_else(between(sodio, 111, 119), 3, 4))))))),
+  k =  if_else(potasio > 6.9, 4,
+            if_else(between(potasio, 6, 6.9), 3,
+                    if_else(between(potasio, 5.5, 5.9), 1,
+                            if_else(between(potasio, 3.5, 5.4), 0,
+                                    if_else(between(potasio, 3, 3.4), 1,
+                                            if_else(between(potasio, 2.5,2.9),2, 4)))))),
+    
+  cr =  if_else(crea > 3.4, 4, 
+            if_else(between(crea,2,3.4),3,
+                    if_else(between(crea,1.5,1.9), 2,
+                            if_else(between(crea, .6, 1.4),0,2)))),
+    
+  hematocrito =  if_else(hto > 59.9, 4,
+            if_else(between(hto, 50,59.9),2,
+                    if_else(between(hto, 46,49.9),1,
+                            if_else(between(hto, 30, 45.9),0,
+                                    if_else(between(hto, 20, 29.9), 2,4))))),
+    
+    
+    leucocitos = if_else(leucos > 39.9, 4,
+                         if_else(between(leucos, 20, 39.9),2,
+                                 if_else(between (leucos, 15,19.9), 1,
+                                         if_else(between(leucos, 3,14.9),0,
+                                                 if_else(between(leucos, 1,2.9),2, 4))))),
+  
+  ecg = glasgow, 
+  
+  age = if_else(edad <= 44, 0,
+                        if_else(between(edad, 45, 54), 2,
+                                if_else(between(edad, 55,64),3,
+                                        if_else(between(edad, 65, 74),5,6)))),
+  enf_prev = 5)
+}
+
+#Calculando los apaches para después unirlos a la base
+apaches <- rep(NA, times = nrow(uti_final))
+
+for(i in seq_along(apaches)){
+apaches[i] <- apache(pam = uti_final$pam[i], fc = uti_final$fc[i], fr = uti_final$fr[i], fio2 = uti_final$fio2[i],
+                      ph = uti_final$ph[i], sodio = uti_final$sodio[i], potasio = uti_final$potasio[i], crea = uti_final$crea[i], 
+                      hto = uti_final$hto[i], leucos = uti_final$leucos[i], glasgow = uti_final$glasgow[i], edad = uti_final$edad_al_ingreso[i], 
+                      enf_prev = uti_final$org_fail_hist[i], grad_aa = uti_final$grad_aa[i], po2 = uti_final$po2[i],temp = uti_final$temp[i])
+  
+}
+uti_final_2 <- uti_final %>% 
+  ungroup() %>% 
+  mutate(apache = apaches)
+```
+
+```{r Cálculo y adición de SOFA a la base final, include = F}
+#Función de SOFA
+sofa <- function(bt, plaquetas, pafi, pam, cual_vasop, crea, glasgow){
+  
+  sum(bt = if_else(bt < 1.2, 0,
+                   if_else(between(bt, 1.2, 1.99), 1,
+                           if_else(between(bt, 2, 5.99), 2,
+                           if_else(between(bt, 6, 11.99), 3, 4)))),
+      
+      plaquetas = if_else(plaquetas >= 150, 0,
+                          if_else(between(plaquetas, 100, 149), 1,
+                                  if_else(between(plaquetas, 50, 99), 2,
+                                          if_else(between(plaquetas, 20,49), 3, 4)))),
+      
+      pafi = if_else(pafi >=400, 0,
+                     if_else(between(pafi, 300, 399.99),1,
+                             if_else(between(pafi, 200, 299.99),2,
+                                     if_else(between(pafi, 100, 199.99), 3, 4)))),
+      
+      pam = if_else(cual_vasop == "dopamina" | cual_vasop == "dobutamina", 2,
+                    if_else(cual_vasop == "norepi", 4,
+                            if_else(pam >= 70, 0, 1))),
+      
+      crea = if_else(crea < 1.2, 0,
+                     if_else(between(crea, 1.2, 1.99), 1,
+                             if_else(between(crea, 2, 3.49), 2,
+                                     if_else(between(crea,3.5, 4.99), 3, 4)))),
+      
+      glasgow = if_else(glasgow == 15, 0,
+                        if_else(between(glasgow, 13, 14), 1,
+                                if_else(between(glasgow, 10, 12), 2,
+                                        if_else(between(glasgow, 6, 9), 3, 4)))))
+  
+}
+
+#Cálculo de SOFAs
+sofas <- rep(NA, times = nrow(uti_final_2))
+
+for(i in 1:nrow(uti_final_2)){
+  
+sofas[i] <- sofa(bt = uti_final_2$bt[i], plaquetas = uti_final_2$plaquetas[i], pafi = uti_final_2$pafi[i], 
+                  pam = uti_final_2$pam[i], cual_vasop= uti_final_2$cual_vasop[i], crea = uti_final_2$crea[i], 
+                  glasgow = uti_final_2$glasgow[i])
+  
+}
+
+#Agregando los SOFAs a la base
+uti_final_3 <- uti_final_2 %>% 
+  mutate(sofa = sofas)
+```
+
+```{r Recalculando las muertes y los eventos en base a la nueva info que recabé así POR QUÉ HICE ESTO?, include = F}
+#Recalculo de las supervivencias y las censuras
+#OJO No me queda claro por qué estoy haciendo este recálculo, no sé si vuelve innecesario al realizado previamente (CHECAR ESO)
+supervivencias <- function(x,y,z){
+  if_else(!is.na(uti_final_3$defuncion) & uti_final_3$defuncion < x + y,
+                 (uti_final_3$defuncion-x)+1,
+                 if_else(!is.na(uti_final_3$drop_d) & uti_final_3$drop_d <= x+y & uti_final_3$drop_d >=z, 
+                         (uti_final_3$drop_d - x) + 1, 
+                         if_else(!is.na(uti_final_3$last_visit) & uti_final_3$last_visit > x + y, 
+                                 (x + y) - (x + 1), (z - x) +1)))
+}
+
+uti_final_4 <- uti_final_3 %>% 
+  mutate(surv_time_hosp = if_else(!is.na(defuncion), defuncion-fecha_ing_hosp,
+                                  if_else(!is.na(drop_d) & drop_d-fecha_ing_hosp >=0, drop_d-fecha_ing_hosp, 
+                                          if_else(!is.na(last_visit) & last_visit-fecha_ing_hosp >= 0, last_visit-fecha_ing_hosp,
+                                                  fecha_egr_hosp-fecha_ing_hosp))) + 1,
+         surv_time_uti = if_else(!is.na(defuncion), defuncion-fecha_ing_uti+1,
+                                  if_else(!is.na(drop_d) & drop_d-fecha_ing_uti >=0, drop_d-fecha_ing_uti, 
+                                          if_else(!is.na(last_visit) & last_visit-fecha_ing_uti >= 0, last_visit-fecha_ing_uti,
+                                                  fecha_egr_hosp-fecha_ing_uti))) + 1,
+         muerte_uti = if_else(!is.na(defuncion) & defuncion <=fecha_egr_uti, T, F),
+         muerte_hosp = if_else(!is.na(defuncion) & defuncion <=fecha_egr_hosp, T, F),
+         muerte_28_uti = if_else(!is.na(defuncion) & defuncion <= fecha_ing_uti +28, T, F),
+         muerte_60_uti = if_else(!is.na(defuncion) & defuncion <= fecha_ing_uti +60, T, F),
+         muerte_1a_uti = if_else(!is.na(defuncion) & defuncion <= fecha_ing_uti +365, T, F),
+         muerte_28_hosp = if_else(!is.na(defuncion) & defuncion <= fecha_ing_hosp + 28, T, F),
+         muerte_60_hosp = if_else(!is.na(defuncion) & defuncion <= fecha_ing_hosp + 60, T, F),
+         muerte_1a_hosp = if_else(!is.na(defuncion) & defuncion <= fecha_ing_hosp + 365, T, F),
+         surv_time_uti28 = supervivencias(fecha_ing_uti, 28, fecha_egr_uti),
+         surv_time_uti60 = supervivencias(fecha_ing_uti, 60, fecha_egr_uti),
+         surv_time_uti1a = supervivencias(fecha_ing_uti, 365, fecha_egr_uti),
+         surv_time_hosp28 = supervivencias(fecha_ing_hosp, 28, fecha_egr_hosp),
+         surv_time_hosp60 = supervivencias(fecha_ing_hosp, 60, fecha_egr_hosp),
+         surv_time_hosp1a = supervivencias(fecha_ing_hosp, 365, fecha_egr_hosp),
+         surv_time_uti_gral = if_else(!is.na(defuncion) & defuncion <=fecha_egr_uti, (defuncion-fecha_ing_uti) + 1,
+                                      (fecha_egr_uti-fecha_ing_uti) + 1),
+         duracion_estancia_uti = (fecha_egr_uti-fecha_ing_uti) + 1,
+         duracion_vm = difftime(fin_vm, inicio_vm, units = "days")+1,
+         duracion_hosp = (fecha_egr_hosp - fecha_ing_hosp) + 1,
+         tiempo_a_uti = fecha_ing_uti - fecha_ing_hosp + 1,
+         tiempo_a_uti2 = if_else(tiempo_a_uti <=2, "Menor o igual a 2 días", "Más de 2 días"),
+         periodo_ingreso = if_else(year_ing <=2008, "2003-2008", 
+                                   if_else(between(year_ing, 2009, 2014),"2009-2014", "2015-2017")),
+         cultivo_gramneg = if_else(is.na(has_gramneg), F, has_gramneg))
+```
+
+```{r Corrección de variables misceláneas y exclusión de pacientes post quirúrgicos, include = F}
+uti_final_5 <- uti_final_4 %>% 
+  mutate(motivo_ing = if_else(is.na(motivo_ing), "desc", motivo_ing)) %>% 
+  filter(motivo_ing != "po_qx" & motivo_ing != "post_qx") %>% 
+  group_by(registro) %>% 
+  arrange(fecha_ing_uti) %>% 
+  slice(1) %>% 
+  mutate(cd4_v = if_else(is.na(cd4_v) & !is.na(cd4_intra_hosp), cd4_intra_hosp, cd4_v),
+         rna_v = if_else(is.na(rna_v) & !is.na(carga_intra_hosp), carga_intra_hosp, rna_v),
+         detectable = ifelse(rna_v< 50, "indetectable", "detectable"),
+         cuenta_cd4 = if_else(cd4_v >= 200, "Sobre_200", "Bajo_200"),
+         cd4_100 =if_else(cd4_v > 100, "Sobre_100", "Bajo_100"),
+         cd4_50 =if_else(cd4_v > 50, "Sobre_50", "Bajo_50"),
+         cd4_40=if_else(cd4_v > 40, "Sobre_40", "Bajo_40"),
+         edad_50 = if_else(edad_al_ingreso >=50, T, F),
+         naive = if_else(is.na(naive_logical) & !is.na(naive), naive, naive_logical),
+         linfopenia = if_else(leucos * (linfos/100) < 1000,T, F),
+         neutropenia = if_else(leucos * (neutros/100) < 2000, T, F),
+         coagulopatia = if_else(INR >1.7, T, F),
+         hipoalbuminemia = if_else(albumina < 2.8, T, F),
+         apache_20 = if_else(apache >= 20, T, F),
+         sofa_alto = if_else(sofa >=8, T, F), 
+         antimicros_5 = if_else(num_antimo >5, T, F),
+         motivo_ing = if_else(str_detect(motivo_ing, "falla_resp"), "falla_resp", 
+                              if_else(motivo_ing == "neuro", "neuro",
+                                      if_else(motivo_ing == "choque_s", "choque_s", "otro"))),
+         dx_vih = if_else(dx_hosp...107 == "vih", T, 
+                          if_else(is.na(dx_hosp...107), NA, F)),
+         foco_sepsis = if_else(is.na(foco_sepsis), "desc",
+                               if_else(foco_sepsis == "pulmon", "pulmon", 
+                               if_else(foco_sepsis == "neuro", "neuro",
+                                       if_else(str_detect(foco_sepsis, "gastro") | 
+                                                 str_detect(foco_sepsis, "abdomen"), "gastro", "otro")))),
+         control_innsz = if_else(enrol_d < fecha_ing_hosp, T, F),
+         asoc_vih = if_else(asoc_vih == "si", T, F),
+         modo_ingreso = if_else(is.na(modo_ingreso) & (tipo_ingreso == 0 | tipo_ingreso == 3 | tipo_ingreso ==4),
+                                "urg", if_else(is.na(modo_ingreso) & (tipo_ingreso == 1 | tipo_ingreso == 2),
+                                               "piso", modo_ingreso)),
+         anemia = if_else(hb<10, T,F),
+         tmp = if_else(!is.na(tmp), T, F),
+         esteroide_indica = if_else(esteroide == T & tmp == T, "P. jirovecii", 
+                                    if_else(esteroide == F, "No recibió esteroide", "Otra indicación")),
+         art = if_else(naive == T, F, 
+                         if_else(!is.na(art), art, NA)),
+         vm_ing_uci = if_else(!is.na(inicio_vm),T,F))
+```
+
+```{r Modelos de cox no ajustados y finales, include = F}
+cox_no_ajust <- function(y, x, z, b){
+  summary(coxph(Surv(x, y) ~ z, data = b))
+}
+
+#Lista con variables a incluír en los modelos no ajustados
+variables <- as.list(select(uti_final_5, detectable, cuenta_cd4, edad_50, naive, neutropenia, coagulopatia, hipoalbuminemia, asoc_vih, cultivo_gramneg, antimicros_5, profilaxis, modo_ingreso, falla_resp_ing_hosp, falla_resp_ing_uti, motivo_ing, foco_sepsis, num_estancia, esteroide_indica, vasopresor, profilaxis, art, control_innsz, cd4_100, cd4_50, anemia, cd4_40, tiempo_a_uti2, periodo_ingreso, vm_ing_uci))
+
+#No ajustado para dentro de la uti
+cox_uti_noajust <- variables %>% 
+  map(.f = cox_no_ajust, x = uti_final_5$surv_time_uti_gral, y = uti_final_5$muerte_uti, b = uti_final_5)
+
+#No ajustado para 28 días
+cox_28_noajust <- variables %>% 
+  map(.f = cox_no_ajust, x = uti_final_5$surv_time_uti28, y = uti_final_5$muerte_28_uti, b = uti_final_5)
+
+#No ajustado para 60 días
+cox_60_noajust <- variables %>% 
+  map(.f = cox_no_ajust, x = uti_final_5$surv_time_uti60, y = uti_final_5$muerte_60_uti,b = uti_final_5)
+
+#No ajustado para 1 año
+cox_1a_noajust <- variables %>%   
+  map(.f = cox_no_ajust, x = uti_final_5$surv_time_uti1a, y = uti_final_5$muerte_1a_uti,b = uti_final_5)
+
+#Determinando cuales son las variables significativas para cada periodo de tiempo en el modelo no-ajustado, el método para escoger las variables del Cox será STEPWISE
+nombres <- names(variables)
+
+#Para la uti
+significativos_uti <- character(length = length(nombres))
+
+for(i in 1:length(cox_uti_noajust)){
+  significativos_uti[i] <- if_else(cox_uti_noajust[[i]]$coefficients[5] < .1, nombres[i], "nope") 
+}
+
+significativos_uti <- significativos_uti[significativos_uti != "nope" & !is.na(significativos_uti)]
+
+
+#Para los 28 días
+significativos_28 <- character(length = length(nombres))
+
+for(i in 1:length(cox_28_noajust)){
+  significativos_28[i] <- if_else(cox_28_noajust[[i]]$coefficients[5] < .1, nombres[i], "nope") 
+}
+
+significativos_28 <- significativos_28[significativos_28 != "nope" & !is.na(significativos_28)]
+
+
+#Para los 60 días
+significativos_60 <- character(length = length(nombres))
+
+for(i in 1:length(cox_60_noajust)){
+  significativos_60[i] <- if_else(cox_60_noajust[[i]]$coefficients[5] < .1, nombres[i], "nope") 
+}
+
+significativos_60 <- significativos_60[significativos_60 != "nope" & !is.na(significativos_60)]
+
+
+#Para el año
+significativos_1a <- character(length = length(nombres))
+
+for(i in 1:length(cox_1a_noajust)){
+  significativos_1a[i] <- if_else(cox_1a_noajust[[i]]$coefficients[5] < .1, nombres[i], "nope") 
+}
+
+significativos_1a <- significativos_1a[significativos_1a != "nope" & !is.na(significativos_1a)]
+
+
+#Cox ajustado incluyendo a todas las variables
+
+cox_simple_uti <- coxph(Surv(surv_time_uti1a, muerte_1a_uti) ~ asoc_vih   + art + cd4_50 +has_gramneg+esteroide_indica + has_gramneg , data = uti_final_5)
+
+cox_simple_28 <- coxph(Surv(surv_time_uti28, muerte_28_uti) ~   `Evento definitorio de SIDA`  + Sexo + `Vírgen a tratamiento` + Anemia + Hipoalbuminemia + `Cuenta CD4` + `Indicación de esteroide` + `Cultivo con gram negativos`,data = pretty_uti_final_5)
+
+cox_28_ajust <- summary(coxph(Surv(surv_time_uti28, muerte_28_uti) ~  `Evento definitorio de SIDA`  + Sexo + `Vírgen a tratamiento` + Anemia + Hipoalbuminemia + `Cuenta CD4` + `Indicación de esteroide` + `Cultivo con gram negativos`  ,data = pretty_uti_final_5))
+
+cox_simple_60 <-  coxph(Surv(surv_time_uti60, muerte_60_uti) ~ `Evento definitorio de SIDA`  + Sexo + `Vírgen a tratamiento` + Anemia + Hipoalbuminemia + `Cuenta CD4` + `Indicación de esteroide` + `Cultivo con gram negativos` +
+                                 falla_resp_ing_hosp + motivo_ing ,data = pretty_uti_final_5)
+
+cox_60_ajust <- summary(coxph(Surv(surv_time_uti60, muerte_60_uti) ~ `Evento definitorio de SIDA`  + Sexo + `Vírgen a tratamiento` + Anemia + Hipoalbuminemia + `Cuenta CD4` + `Indicación de esteroide`  +
+                                 falla_resp_ing_hosp + motivo_ing ,data = pretty_uti_final_5))
+
+
+cox_simple_1a <- coxph(Surv(surv_time_uti1a, muerte_1a_uti) ~  `Evento definitorio de SIDA`+Sexo+
+            `Vírgen a tratamiento`+
+            Anemia+
+            Hipoalbuminemia+
+            `Cuenta CD4` +
+            `Indicación de esteroide` +
+            `Cultivo con gram negativos`  , data = pretty_uti_final_5)
+
+cox_1a_ajust <- coxph(Surv(surv_time_uti1a, muerte_1a_uti) ~  asoc_vih   + art + cd4_50 +has_gramneg+esteroide_indica + falla_resp_ing_hosp, data = uti_final_5)
+```
+
+```{r Forest plot (hay que depurar muy bien este chunk, recordar que se hicieron muchas cosas de último momento), include = F}
+plot_forest <- function(x){
+  ggforest(x, data = NULL, main = "Hazard ratio",
+  cpositions = c(0.02, 0.22, 0.4), fontsize = 1.5,
+  refLabel = "Referencia", noDigits = 2)  
+  
+}
+
+#Forest plot para los COX ajustados
+
+plot_forest(cox_simple_uti)
+plot_forest(cox_simple_28)
+plot_forest(cox_simple_60)
+plot_forest(cox_simple_1a)
+plot_forest(cox_simple_1aej)
+
+
+
+
+
+#Forest 28 días
+
+
+
+
+#Forest 60 días
+
+
+
+
+
+
+
+#Forest de un año
+Hipoalbuminemia = hipoalbuminemia
+Sexo = gender
+`Vírgen a tratamiento` = naive
+`Cultivo con gram negativos` = has_gramneg
+ `Tiempo al ingreso a UCI`= tiempo_a_uti5
+
+a1_uti_final_5 <- uti_final_5 %>%
+  transmute(surv_time_uti1a,
+            muerte_1a_uti,
+            `Enfermedad definitoria de SIDA`= factor(if_else(asoc_vih == T,"Yes", "No"), levels = c("Yes", "No")),
+            `Recibía antirretrovirales al ingreso` = art,
+            `Cuenta CD4` = cd4_50,
+            `Indicación de esteroide` = esteroide_indica,
+            `Falla respiratoria al ingreso a UCI`= vm_ing_uci,
+            `Edad` = if_else(edad_50 == T, "Mayor de 50", "50 o menor")) %>%
+  ungroup() %>% 
+  select(-registro)
+
+`Recibía antirretrovirales al ingreso` = art
+glimpse(uti_final_5$edad_50)
+
+print(forest_model(coxph(Surv(surv_time_uti1a, muerte_1a_uti) ~ ., a1_uti_final_5)))
+cox.zph(coxph(Surv(surv_time_uti_gral, muerte_uti) ~ ., uti_uti_final_5))
+
+#Forest dentro de la uti
+uti_uti_final_5 <- uti_final_5 %>%
+  transmute(surv_time_uti_gral,
+            muerte_uti,
+            `Enfermedad definitoria de SIDA`= asoc_vih,
+            `Recibía antirretrovirales al ingreso` = nai,
+            `Cuenta CD4` = cd4_50,
+            `Cultivo con gram negativos` = cultivo_gramneg) %>%
+  ungroup() %>% 
+  select(-registro)
+
+print(forest_model(coxph(Surv(surv_time_uti_gral, muerte_uti) ~ ., uti_uti_final_5)))
+cox.zph(coxph(Surv(surv_time_uti_gral, muerte_uti) ~ ., uti_uti_final_5))
+
+
+#FOREST AJUSTADOS POR TIEMPO PARA CUMPLIR CON SUPUESTO DE PROPORCIONALIDAD
+
+vet2 <- survSplit(Surv(surv_time_uti1a, muerte_1a_uti) ~ ., data= a1_uti_final_5, cut=c(28, 60), episode= "tgroup", id="id")
+
+vfit2 <- coxph(Surv(tstart, surv_time_uti1a, muerte_1a_uti) ~ `Enfermedad definitoria de SIDA`:strata(tgroup) + `Recibía antirretrovirales al ingreso` +
+               `Cuenta CD4` + `Indicación de esteroide` + `Falla respiratoria al ingreso a UCI` + `Edad`, data=vet2)
+
+
+print(forest_model(coxph(coxph(Surv(tstart, surv_time_uti1a, muerte_1a_uti) ~ `Enfermedad definitoria de SIDA`:strata(tgroup) + `Recibía antirretrovirales al ingreso` +
+               `Cuenta CD4` + `Indicación de esteroide` + `Falla respiratoria al ingreso a UCI`, data=vet2))))
+cox.zph(vfit2)
+summary(vfit2)
+plot_forest(vfit2)
+```
+
+```{r Forest plot BUENO Y AJUSTADO AL TIEMPO PROPORCIONAL (obvio hay que revisar este chunk para ver cual es su relación con el anterior), include = F}
+label <- paste0("X", 1:9)
+mean  <- c(1.26,0.59,1.12,0.28,.53,1.54,30.13,0.73,2.59) 
+lower <- c(0.60,0.27,0.57,0.09,0.18,0.49,6.72,0.08,0.44)
+upper <- c(2.65,1.28,2.19,0.79,1.53, 4.8,135.15, 6.22, 15.21)
+
+df <- data.frame(label, mean, lower, upper) %>% 
+  mutate(hr_resumido = paste(mean, " ", "(", lower, "-", upper, ")", sep = ""))
+
+tabletext <- c("Edad","Recibía antirretrovirales al ingreso", "Cuenta de CD4 > 50", "Indicación de esteroide P. jirovecii", 
+               "Otra indicación de esteroide", "Falla respiratoria al ingreso a UCI", "Enfermedad definitoria de SIDA (30 d)",
+               "Enfermedad definitoria de SIDA (30-60 d)", "Enfermedad definitoria de SIDA (60-365 d)")
+
+forestplot(
+           mean = df$mean, 
+           lower = df$lower, 
+           upper = df$upper, 
+           labeltext = df$hr_resumido,
+           ci.vertices = T,
+           boxsize = .4,
+           zero = 1,
+           clip = c(0,10),
+           hrzl_lines = list("1" = gpar(lty=2),
+                             "2" = gpar(lty = 2),
+                             "3" = gpar(lty = 2),
+                             "5" = gpar(lty = 2),
+                             "6" = gpar(lty = 2)),
+           new_page = T,
+           lwd.ci = 5,
+           lwd.zero = 5,
+           col = fpColors(lines = "black"),
+           graph.pos = "left",
+           is.summary = T)
+```
+
+```{r Curvas KM (hay que depurar muy bien este chunk porque puede que las curvas que utilicé estén en el script, no en el markdown), echo = F}
+
+sobj <- with(uti_final_5, Surv(surv_time_uti1a, muerte_1a_uti))
+sobrevida <- survfit(sobj ~ 1, data = uti_final_5)
+
+ggsurvplot(sobrevida, data = uti_final_5,
+           tables.y.text = FALSE,
+           risk.table = "abs_pct",
+           conf.int = F,
+           palette = "lancet",
+           xlim = c(0,370),
+           censor.shape = "|",
+           xlab = "Tiempo (días)",
+           ylab = "Tasa de supervivencia",
+           pval = F,
+           censor.size = 8,
+           size = 2.5,
+           risk.table.title = "Personas en riesgo (%)",
+           break.time.by = 30,
+           ggtheme = theme_survminer())
+
+
+sobj2 <- with(uti_final_5, Surv(surv_time_uti1a, muerte_1a_uti))
+sobrevida_2 <- survfit(sobj ~ asoc_vih, data = uti_final_5)
+summary(sobrevida)
+
+
+ggsurvplot(sobrevida_2, data = uti_final_5,
+           risk.table = T,
+           tables.y.text = FALSE,
+           palette = "lancet",
+           xlim = c(0,370),
+           censor.shape = "|",
+           xlab = "Tiempo (días)",
+           ylab = "Tasa de supervivencia",
+           pval = T,
+           censor.size = 6,
+           size = 2.5,
+           risk.table.title = "Número en riesgo",
+           break.time.by = 60,
+           ggtheme = theme_survminer())
+```
+
+```{r Variables sociodemográficas a incluir en la ppt , include = F}
+#MUY NECESARIO QUE PARA ESTOS CÁLCULOS UTILICE UNA FUNCIÓN
+#Gender
+table(uti_final_5$gender)
+table(uti_final_5$gender)/n_distinct(uti_final_5$registro)
+
+table(uti_final_5$gender[uti_final_5$muerte_1a_uti==T])
+table(uti_final_5$gender[uti_final_5$muerte_1a_uti==T])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+table(uti_final_5$gender[uti_final_5$muerte_1a_uti==F])
+table(uti_final_5$gender[uti_final_5$muerte_1a_uti==F])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+#Edad
+median(uti_final_5$edad_al_ingreso)
+range(uti_final_5$edad_al_ingreso)
+
+median(uti_final_5$edad_al_ingreso[uti_final_5$muerte_1a_uti==F])
+range(uti_final_5$edad_al_ingreso[uti_final_5$muerte_1a_uti==F])
+
+median(uti_final_5$edad_al_ingreso[uti_final_5$muerte_1a_uti==T])
+range(uti_final_5$edad_al_ingreso[uti_final_5$muerte_1a_uti==T])
+
+#Llevaba su control en el instituto
+
+sum(uti_final_5$enrol_d < uti_final_5$fecha_ing_hosp)
+sum(uti_final_5$enrol_d < uti_final_5$fecha_ing_hosp)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$enrol_d >= uti_final_5$fecha_ing_hosp)
+
+sum(uti_final_5$enrol_d[uti_final_5$muerte_1a_uti==T] < uti_final_5$fecha_ing_hosp[uti_final_5$muerte_1a_uti==T])
+sum(uti_final_5$enrol_d[uti_final_5$muerte_1a_uti==T] < uti_final_5$fecha_ing_hosp[uti_final_5$muerte_1a_uti==T])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+sum(uti_final_5$enrol_d[uti_final_5$muerte_1a_uti==F] < uti_final_5$fecha_ing_hosp[uti_final_5$muerte_1a_uti==F])
+sum(uti_final_5$enrol_d[uti_final_5$muerte_1a_uti==F] < uti_final_5$fecha_ing_hosp[uti_final_5$muerte_1a_uti==F])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+
+#Fue diagnosticado en la UTI
+
+sum(uti_final_5$dx_vih[uti_final_5$muerte_1a_uti==F], na.rm = T)
+sum(uti_final_5$dx_vih[uti_final_5$muerte_1a_uti==F], na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+sum(uti_final_5$dx_vih, na.rm = T)
+sum(uti_final_5$dx_vih, na.rm = T)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$dx_vih[uti_final_5$muerte_1a_uti==T], na.rm = T)
+sum(uti_final_5$dx_vih[uti_final_5$muerte_1a_uti==T], na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+#Naive
+
+sum(uti_final_5$naive,na.rm = T)
+sum(uti_final_5$naive,na.rm = T)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$naive[uti_final_5$muerte_1a_uti==T],na.rm = T)
+sum(uti_final_5$naive[uti_final_5$muerte_1a_uti==T],na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+sum(uti_final_5$naive[uti_final_5$muerte_1a_uti==F],na.rm = T)
+sum(uti_final_5$naive[uti_final_5$muerte_1a_uti==F],na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+#ART al ingreso
+sum(uti_final_5$art,na.rm = T)
+sum(uti_final_5$art,na.rm = T)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$art[uti_final_5$muerte_1a_uti==T],na.rm = T)
+sum(uti_final_5$art[uti_final_5$muerte_1a_uti==T],na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+sum(uti_final_5$art[uti_final_5$muerte_1a_uti==F],na.rm = T)
+sum(uti_final_5$art[uti_final_5$muerte_1a_uti==F],na.rm = T)/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+#Carga viral
+
+table(uti_final_5$detectable)
+table(uti_final_5$detectable)/n_distinct(uti_final_5$registro)
+
+table(uti_final_5$detectable[uti_final_5$muerte_1a_uti==F])
+table(uti_final_5$detectable[uti_final_5$muerte_1a_uti==F])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+table(uti_final_5$detectable[uti_final_5$muerte_1a_uti==T])
+table(uti_final_5$detectable[uti_final_5$muerte_1a_uti==T])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+#Conteo CD4
+
+median(uti_final_5$cd4_v, na.rm = T)
+range(uti_final_5$cd4_v, na.rm = T)
+
+median(uti_final_5$cd4_v[uti_final_5$muerte_1a_uti==T], na.rm = T)
+range(uti_final_5$cd4_v[uti_final_5$muerte_1a_uti==T], na.rm = T)
+
+median(uti_final_5$cd4_v[uti_final_5$muerte_1a_uti==F], na.rm = T)
+range(uti_final_5$cd4_v[uti_final_5$muerte_1a_uti==F], na.rm = T)
+
+#Asoc_VIH (ADE)
+
+
+table(uti_final_5$asoc_vih)
+table(uti_final_5$asoc_vih)/n_distinct(uti_final_5$registro)
+
+table(uti_final_5$asoc_vih[uti_final_5$muerte_1a_uti==F])
+table(uti_final_5$asoc_vih[uti_final_5$muerte_1a_uti==F])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+table(uti_final_5$asoc_vih[uti_final_5$muerte_1a_uti==T])
+table(uti_final_5$asoc_vih[uti_final_5$muerte_1a_uti==T])/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==T])
+
+
+#Pérdida al seguimiento
+
+perdidos <- uti_final_5 %>% 
+  filter(surv_time_cens1a < 364 & muerte_1a_uti == F) %>% 
+  select(surv_time_cens1a, everything()) %>% 
+  count() %>% 
+  n_distinct()
+perdidos/ n_distinct(uti_final_5$registro)
+perdidos/ n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F])
+
+perdidos
+#Pérdida al seguimiento según si ya llevaba su control en el innsz
+uti_final_5 %>% 
+  filter(surv_time_cens1a < 364 & muerte_1a_uti == F) %>% 
+  group_by(control_innsz) %>% 
+  count()
+
+#Descripción de apaches
+sum(!is.na(uti_final_5$apache))
+round(sum(!is.na(uti_final_5$apache))/n_distinct(uti_final_5$registro),1)
+
+median(uti_final_5$apache,na.rm = T)
+range(uti_final_5$apache,na.rm = T)
+fivenum(uti_final_5$apache,na.rm = T)
+
+sum(!is.na(uti_final_5$apache[uti_final_5$muerte_1a_uti==F]))
+round(sum(!is.na(uti_final_5$apache[uti_final_5$muerte_1a_uti==F]))/n_distinct(uti_final_5$registro[uti_final_5$muerte_1a_uti==F]),1)
+
+median(uti_final_5$apache[uti_final_5$muerte_1a_uti==F],na.rm = T)
+range(uti_final_5$apache[uti_final_5$muerte_1a_uti==F],na.rm = T)
+fivenum(uti_final_5$apache[uti_final_5$muerte_1a_uti==F],na.rm = T)
+
+median(uti_final_5$apache[uti_final_5$muerte_1a_uti==T],na.rm = T)
+range(uti_final_5$apache[uti_final_5$muerte_1a_uti==T],na.rm = T)
+fivenum(uti_final_5$apache[uti_final_5$muerte_1a_uti==T],na.rm = T)
+
+#Descripción de SOFA
+sum(!is.na(uti_final_5$sofa))
+round(sum(!is.na(uti_final_5$sofa))/n_distinct(uti_final_5$registro),1)
+
+median(uti_final_5$sofa,na.rm = T)
+range(uti_final_5$sofa,na.rm = T)
+fivenum(uti_final_5$sofa,na.rm = T)
+
+median(uti_final_5$sofa[uti_final_5$muerte_1a_uti==F],na.rm = T)
+range(uti_final_5$sofa[uti_final_5$muerte_1a_uti==F],na.rm = T)
+fivenum(uti_final_5$sofa[uti_final_5$muerte_1a_uti==F],na.rm = T)
+
+median(uti_final_5$sofa[uti_final_5$muerte_1a_uti==T],na.rm = T)
+range(uti_final_5$sofa[uti_final_5$muerte_1a_uti==T],na.rm = T)
+fivenum(uti_final_5$sofa[uti_final_5$muerte_1a_uti==T],na.rm = T)
+
+#Medianas de apache según si murieron o no
+
+uti_final_5 %>% 
+  filter(!is.na(apache)) %>% 
+  group_by(muerte_1a_uti) %>% 
+  summarise(mediana_apache = median(apache))
+
+
+#Medianas de sofa según si murieron o no
+uti_final_5 %>% 
+  filter(!is.na(sofa)) %>% 
+  group_by(muerte_1a_uti) %>% 
+  summarise(mediana_sofa = median(sofa))
+
+
+#MUERTES SEGUN PERIODO
+
+sum(uti_final_5$muerte_uti)
+sum(uti_final_5$muerte_uti)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$muerte_hosp)
+sum(uti_final_5$muerte_hosp)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$muerte_28_uti)
+sum(uti_final_5$muerte_28_uti)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$muerte_60_uti)
+sum(uti_final_5$muerte_60_uti)/n_distinct(uti_final_5$registro)
+
+sum(uti_final_5$muerte_1a_uti)
+sum(uti_final_5$muerte_1a_uti)/n_distinct(uti_final_5$registro)
+
+sum(!is.na(uti_final_5$naive))/138
+sum(!is.na(uti_final_5$art))
+
+sum(!is.na(uti_final_5$cd4_50))
+sum(!is.na(uti_final_5$cd4_50))/138
+
+sum(!is.na(uti_final_5$detectable))
+sum(!is.na(uti_final_5$cd4_50))/138
+
+
+sum(!is.na(uti_final_5$apache))
+sum(!is.na(uti_final_5$apache))/138
+sum(!is.na(uti_final_5$sofa))
+sum(!is.na(uti_final_5$sofa))/138
+
+
+```
+
+## **Abstract**
+
+## **Introduction**
+
+Los pacientes con VIH son propensos a desarrollar infecciones oportunistas, las cuales pueden llegar a ser de gravedad. Históricamente, su admisión a la unidad de terapia intensiva (UTI) era frecuentemente por esta causa. Desde que la terapia antirretroviral altamente activa (HAART, por sus siglas en inglés) salió a la luz se ha reportado en estudios de países desarrollados una reducción en la proporción de infecciones oportunistas como causa de ingreso a la UTI y mortalidad dentro de esta. Un estudio llevado a cabo en el INNSZ y publicado en 2007 muestra una reducción en la mortalidad a largo plazo en la era post HAART, sin embargo, la mayoría de las admisiones son por infecciones oportunistas y la mortalidad a corto plazo es alta (casi el 60%). Estudios recientes de países en desarrollo reportan hallazgos similares, siendo la mayoría de las admisiones consecuencia de un evento definitorio de SIDA (infecciones oportunistas principalmente). Por ende, consideramos que se justifica la realización de un estudio en nuestra población que describa los principales motivos de ingreso a la UTI, así como el pronóstico a corto y largo plazo que presentan estos pacientes. 
+Nuestro objetivo principal fue describir los motivos de ingreso a la UTI que presentan pacientes con VIH tratados en la clínica del instituto. Como objetivos secundarios describimos la mortalidad a corto plazo (durante la estancia en UTI) y la supervivencia a largo plazo, así como las variables asociadas a ella. 
+
+## **Materials and Methods**
+Se realizó un estudio observacional tipo cohorte retrospectivo en el Instituto Nacional de Ciencias Médicas y Nutrición Salvador Zubirán, un hospital de 3er nivel en ciudad de México. La UTI cuenta con 12 camas y tecnología de punta, así como interconsultantes de todas las especialidades del instituto a cualquier hora del día. La población de estudio consistió en pacientes con VIH tratados en la clínica del instituto que ingresaron a la UTI en el periodo de 2003-01-01 al 2017-09-31. Los pacientes fueron identificados al realizar un cross-match con la base de hospitalizados en la UTI con la de la clínica de VIH. Los criterios de inclusión fueron: ser mayor de edad al ingreso, tener serología positiva para VIH, y llevar su tratamiento en la clínica del instituto. En caso de tener más de un ingreso a la UTI, se consideraron como separados solo si fueron durante una hospitalización diferente. 
+La información fue recolectada de los expedientes electrónicos del instituto. Las variables que incluimos fueron: edad, sexo, edad al diagnóstico, fecha de enrolamiento a la clínica de VIH, cuenta de CD4 más cercana al ingreso, carga viral más cercana al ingreso (se incluyeron aquellas obtenidas en los 90 días previos al ingreso o en los 7 días posteriores a él), carga viral detectable (se consideró una carga > 50 copias por mL como detectable), uso de terapia antirretroviral previo al ingreso (se consideró solo a quienes llevaban al menos 90 días de tratamiento), si la terapéutica recibida fue HAART, uso de profilaxis antimicrobiana previo al ingreso, motivo de ingreso a la UTI (estas se categorizaron como falla respiratoria, sepsis, enfermedad neurológica, choque cardiogénico y otros), diagnóstico al egreso de la UTI, días en la UTI, mortalidad dentro de la terapia, requerimiento de ventilación mecánica dentro de la terapia y requerimiento de terapia de reemplazo renal dentro de la terapia. Se incluyó también el puntaje en la escala APACHE II, dicotomizando la variable según si el puntaje era <13 o >=13. Falla respiratoria fue definida como un requerimiento de ventilación mecánica invasiva o no invasiva o ventilación con bolsa reservorio , así como una PaFi <300. El diagnóstico final fue relacionado con la clasificación establecida en 1993 por la CDC para eventos definitorios de SIDA (ADE, por sus siglas en inglés), en caso de presentar alguno que coincida con el motivo de ingreso se consideró que ingresó por un ADE. 
+Se utilizó R software versión 3.5.3 para el análisis estadístico. Se utilizó estadística descriptiva para las variables demográficas: proporciones para variables categóricas e intervalos de confianza para variables continuas. Se utilizarán modas para los motivos de ingreso por año. En cuanto a variables predictoras de mortalidad, se usó prueba de Fisher para variables categóricas y t de Student o U de Mann-Whitney para variables continuas. Se utilizó prueba de Shapiro-Wilk para probar normalidad en variables predictoras continuas, en la cual se consideró estadísticamente significativa una p <0.05. Además, se usó una regresión logística con cada una de las variables predictoras, considerando como relevantes aquellas variables que modificaron el riesgo en al menos 10%.  
+
+La supervivencia fue descrita con curvas Kaplan Meier. Se utilizó un modelo de regresión de Cox en el cual se incluyeron sólo las variables que fueron consideradas como relevantes en la regresión logística. Para supervivencia solo se incluyó en el análisis a la primera admisión.
+
+## **Results**
+Nuestro periodo de estudio fue de casi 15 años (`r (15 * 12) - 3` meses), durante los cuales hubo `r length(uti_periodo$registro)` ingresos a la UTI (`r n_distinct(uti_periodo$registro)` pacientes diferentes). De ellos, `r n_distinct(uti_basic_prev$registro)` eran pacientes con VIH que llevaban su control en la clínica del instituto previo a su ingreso a la terapia intensiva, mientras que `r n_distinct(uti_basic$registro) - n_distinct(uti_basic_prev$registro)` ingresaron a la UTI y posteriormente fueron ingresados a la base de la clínica. Esto resultó en un total de `r n_distinct(uti_basic$registro)` pacientes con VIH que ingresaron a la UTI y un total de `r length(uti_basic$registro)` ingresos (`r round((length(uti_basic$registro)/length(uti_in$registro)*100), digits = 1)`% de los ingresos). El máximo número de ingresos a la UTI por un paciente con VIH fue de `r max_vis[1,2]`. La mayoría de los pacientes eran hombres, con un total de `r sum(uti_unique_patient$gender == "Male")` (`r round((sum(uti_unique_patient$gender == "Male")/length(uti_unique_patient$gender))*100, digits = 1)`%).
+
+En `r sum(uti_basico_4$detectable == "indetectable"|uti_basico_4$detectable == "detectable")` ingresos se contó con carga viral (`r round((sum(uti_basico_4$detectable == "indetectable"|uti_basico_4$detectable == "detectable")/length(uti_basico_4$detectable))*100, digits = 1)`%). De ellos, `r sum(uti_basico_4$detectable == "indetectable")` fueron indetectables (`r round(sum(uti_basico_4$detectable == "indetectable")/(sum(uti_basico_4$detectable == "indetectable"|uti_basico_4$detectable == "detectable"))*100, digits = 1)`%). A su vez, se obtuvo conteo de linfocitos CD4 en `r sum(is.na(uti_basico_4$cuenta_cd4)` ingresos (`r round((sum(is.na(uti_basico_4$cuenta_cd4)/length(uti_basico_4$cuenta_cd4))*100, digits = 1))`%), de los cuales `r sum(uti_basico_4$cuenta_cd4 == "below 200")`  tuvieron un conteo debajo de 200 (`r round((sum(uti_basico_4$cuenta_cd4 == "below 200")/sum(is.na(uti_basico_4$cuenta_cd4)))*100, digits = 1)`%).
+
+En cuanto a tratamiento antirretroviral, encontramos registrados a `r n_distinct(z$registro)` pacientes en la base de ART (`r round((n_distinct(z$registro)/n_distinct(uti_basic$registro))*100, digits = 1)`%). De ellos, `r n_distinct(z1$registro)` iniciaron su tratamiento previo al ingreso (`r round((n_distinct(z1$registro)/n_distinct(z$registro))*100, digits = 1)`% respecto a pacientes tratados, `r round((n_distinct(z1$registro)/n_distinct(uti_basic$registro))*100, digits = 1)`% respecto a todos los pacientes) y aportaron un total de `r n_distinct(z1$fecha_ing)` ingresos. De los pacientes tratados previo al ingreso, `r sum(z1$es_haart == "haart")` eran tratados con HAART (`r round((sum(z1$es_haart == "haart")/length(z1$es_haart))*100, digits = 1)`%).
+
+
+### *Características de la estancia en la UTI*
+La duración media de la estancia fue de `r round(mean(uti_basic$duracion_estancia), digits = 1)` días, con un rango de `r range(uti_basic$duracion_estancia)` días. El motivo de ingreso más frecuente fue ____________________________. 
+
+
+## **Discussion**
